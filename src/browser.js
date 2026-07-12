@@ -2,7 +2,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { chromium } from "playwright";
 
-const MATCHUP_RE = /\b[A-Za-z]{2,15}\s*@\s*[A-Za-z]{2,15}\b/;
+const MATCHUP_RE = /\b[A-Z]{2,4}\s*@\s*[A-Z]{2,4}\b/;
 
 function clean(text) {
   return String(text || "").replace(/\s+/g, " ").trim();
@@ -107,6 +107,79 @@ async function loginIfNeeded(page, config) {
   return true;
 }
 
+async function closeOpenPanels(page) {
+  const done =
+    (await firstVisible(page.getByRole("button", { name: /^done$/i }))) ||
+    (await firstVisible(page.getByText(/^done$/i)));
+
+  if (done) {
+    await done.click({ force: true }).catch(() => {});
+    await page.waitForTimeout(500);
+  }
+
+  const dialogs = page.locator('[role="dialog"], [aria-modal="true"]');
+  const count = await dialogs.count();
+
+  for (let i = 0; i < count; i += 1) {
+    const dialog = dialogs.nth(i);
+    if (!(await dialog.isVisible().catch(() => false))) continue;
+
+    const closeButton =
+      (await firstVisible(dialog.getByRole("button", { name: /close/i }))) ||
+      (await firstVisible(dialog.locator('button').filter({ hasText: "×" }))) ||
+      (await firstVisible(dialog.locator('button').filter({ hasText: "✕" })));
+
+    if (closeButton) {
+      await closeButton.click({ force: true }).catch(() => {});
+      await page.waitForTimeout(300);
+    } else {
+      await page.keyboard.press("Escape").catch(() => {});
+    }
+  }
+}
+
+async function ensureHighlightEnabled(page, config) {
+  // Open the highlights panel if the main button exists.
+  const highlightsButton =
+    (await firstVisible(page.getByRole("button", { name: /highlights/i }))) ||
+    (await firstVisible(page.getByText(/^highlights$/i)));
+
+  if (highlightsButton) {
+    await highlightsButton.click({ force: true }).catch(() => {});
+    await page.waitForTimeout(700);
+  }
+
+  const sleeperText = await firstVisible(
+    page.getByText(config.highlightName, { exact: true })
+  );
+
+  if (sleeperText) {
+    const row = sleeperText.locator("xpath=ancestor::*[self::div or self::li][1]");
+    const checkbox = row.locator('input[type="checkbox"]');
+
+    if (await checkbox.count()) {
+      const checked = await checkbox.first().isChecked().catch(() => true);
+      if (!checked) {
+        await checkbox.first().check({ force: true }).catch(() => {});
+      }
+    } else {
+      // Many versions use a colored toggle instead of a checkbox.
+      const toggle =
+        (await firstVisible(row.getByRole("switch"))) ||
+        (await firstVisible(row.locator('button[aria-pressed]')));
+
+      if (toggle) {
+        const pressed = await toggle.getAttribute("aria-pressed");
+        if (pressed === "false") {
+          await toggle.click({ force: true }).catch(() => {});
+        }
+      }
+    }
+  }
+
+  await closeOpenPanels(page);
+}
+
 async function applySavedSettings(page, config) {
   // Season
   await clickByText(page, config.season, { exact: true });
@@ -115,32 +188,15 @@ async function applySavedSettings(page, config) {
   await selectFromDropdown(page, "Range", config.range);
   await selectFromDropdown(page, "Type", config.type);
 
-  // Saved highlight button/chip
-  await clickByText(page, config.highlightName, { exact: true });
-
-  // Some versions use a filter panel. If the highlight chip is hidden, open filters and retry.
-  const hasHighlight = await page.getByText(config.highlightName, { exact: true }).count();
-  if (!hasHighlight) {
-    const filterButton =
-      (await firstVisible(page.getByRole("button", { name: /filter|highlight/i }))) ||
-      (await firstVisible(page.locator('button[aria-label*="filter" i]')));
-    if (filterButton) {
-      await filterButton.click().catch(() => {});
-      await clickByText(page, config.highlightName, { exact: true });
-    }
-  }
+  // Ensure the saved highlight is enabled, then close the panel before screenshots.
+  await ensureHighlightEnabled(page, config);
 
   await page.waitForTimeout(config.pageSettleMs);
 }
 
 async function discoverGameTargets(page) {
-  /*
-    PropFinder's matchup cards are not always rendered as buttons or links.
-    Search the live DOM for text containing "Team @ Team", then climb to the
-    nearest clickable/card-like ancestor.
-  */
   const raw = await page.evaluate(() => {
-    const matchup = /\b[A-Za-z]{2,20}(?:\s+[A-Za-z]{2,20})?\s*@\s*[A-Za-z]{2,20}(?:\s+[A-Za-z]{2,20})?\b/;
+    const matchup = /\b[A-Z]{2,4}\s*@\s*[A-Z]{2,4}\b/;
     const results = [];
     const seen = new Set();
 
@@ -151,7 +207,7 @@ async function discoverGameTargets(page) {
         .replace(/\s+/g, " ")
         .trim();
 
-      if (!text || text.length > 250) continue;
+      if (!text || text.length > 220) continue;
 
       const match = text.match(matchup);
       if (!match) continue;
@@ -159,33 +215,46 @@ async function discoverGameTargets(page) {
       const name = match[0].replace(/\s+/g, " ").trim();
       if (seen.has(name)) continue;
 
-      // Prefer the smallest element that contains the matchup text.
-      const childHasSameMatch = Array.from(element.children || []).some((child) => {
+      // Prefer the smallest node containing the exact abbreviated matchup.
+      const childHasMatch = Array.from(element.children || []).some((child) => {
         const childText = (child.innerText || child.textContent || "")
           .replace(/\s+/g, " ")
           .trim();
         return matchup.test(childText);
       });
 
-      if (childHasSameMatch) continue;
+      if (childHasMatch) continue;
 
       let target = element;
       let cursor = element;
 
-      for (let i = 0; i < 5 && cursor; i += 1, cursor = cursor.parentElement) {
+      for (let i = 0; i < 8 && cursor; i += 1, cursor = cursor.parentElement) {
+        const rect = cursor.getBoundingClientRect();
         const style = window.getComputedStyle(cursor);
+        const cursorText = (cursor.innerText || cursor.textContent || "")
+          .replace(/\s+/g, " ")
+          .trim();
+
+        const looksLikeCard =
+          rect.width >= 180 &&
+          rect.width <= 700 &&
+          rect.height >= 45 &&
+          rect.height <= 220 &&
+          cursorText.length <= 260 &&
+          matchup.test(cursorText);
+
         const clickable =
           cursor.tagName === "BUTTON" ||
           cursor.tagName === "A" ||
           cursor.getAttribute("role") === "button" ||
           cursor.getAttribute("role") === "tab" ||
           cursor.hasAttribute("data-game-id") ||
-          cursor.onclick ||
+          typeof cursor.onclick === "function" ||
           style.cursor === "pointer";
 
-        if (clickable) {
+        if (clickable || looksLikeCard) {
           target = cursor;
-          break;
+          if (clickable) break;
         }
       }
 
@@ -194,11 +263,10 @@ async function discoverGameTargets(page) {
 
       results.push({
         name,
-        text,
         targetId: id,
-        tag: target.tagName,
-        href: target.getAttribute("href"),
-        gameId: target.getAttribute("data-game-id"),
+        text: (target.innerText || target.textContent || "")
+          .replace(/\s+/g, " ")
+          .trim(),
       });
 
       seen.add(name);
@@ -211,44 +279,34 @@ async function discoverGameTargets(page) {
 }
 
 async function clickGame(page, game) {
-  if (game.targetId) {
-    const tagged = page.locator(
-      `[data-pf-bot-target="${game.targetId.replaceAll('"', '\\"')}"]`
-    ).first();
+  const selector = `[data-pf-bot-target="${game.targetId.replaceAll('"', '\\"')}"]`;
+  const target = page.locator(selector).first();
 
-    if (await tagged.isVisible().catch(() => false)) {
-      await tagged.scrollIntoViewIfNeeded().catch(() => {});
-      await tagged.click({ force: true }).catch(() => {});
-      return true;
-    }
+  if (!(await target.isVisible().catch(() => false))) {
+    return false;
   }
 
-  if (game.href) {
-    const link = page.locator(`a[href="${game.href.replaceAll('"', '\\"')}"]`).first();
-    if (await link.isVisible().catch(() => false)) {
-      await link.click();
-      return true;
-    }
-  }
+  await page.evaluate(() => window.scrollTo(0, 0));
+  await target.scrollIntoViewIfNeeded().catch(() => {});
 
-  if (game.gameId) {
-    const target = page.locator(`[data-game-id="${game.gameId.replaceAll('"', '\\"')}"]`).first();
-    if (await target.isVisible().catch(() => false)) {
-      await target.click();
-      return true;
-    }
-  }
+  const box = await target.boundingBox();
+  if (!box) return false;
 
-  const exactText = page.getByText(game.name, { exact: false });
-  const target = await firstVisible(exactText);
+  // Use a real mouse click in the center of the game card.
+  await page.mouse.click(box.x + box.width / 2, box.y + box.height / 2);
+  await page.waitForTimeout(1800);
 
-  if (target) {
-    await target.scrollIntoViewIfNeeded().catch(() => {});
-    await target.click({ force: true }).catch(() => {});
-    return true;
-  }
+  // A second JS click helps with cards whose click handler is on an ancestor.
+  await page.evaluate((sel) => {
+    const el = document.querySelector(sel);
+    if (!el) return;
+    el.dispatchEvent(new MouseEvent("mousedown", { bubbles: true }));
+    el.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
+    el.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+  }, selector);
 
-  return false;
+  await page.waitForTimeout(1800);
+  return true;
 }
 
 async function isConfirmedLineup(page) {
@@ -308,6 +366,87 @@ async function getScreenshotTarget(page) {
   }
 
   return null;
+}
+
+async function captureGameSection(page, screenshotPath) {
+  await closeOpenPanels(page);
+
+  const confirmed = await firstVisible(page.getByText(/Confirmed Lineup/i));
+
+  if (!confirmed) {
+    await page.screenshot({
+      path: screenshotPath,
+      fullPage: true,
+      animations: "disabled",
+    });
+    return;
+  }
+
+  await confirmed.scrollIntoViewIfNeeded().catch(() => {});
+  await page.waitForTimeout(500);
+
+  const clip = await page.evaluate(() => {
+    const all = Array.from(document.querySelectorAll("body *"));
+    const confirmedNode = all.find((node) =>
+      /Confirmed Lineup/i.test(
+        (node.innerText || node.textContent || "").replace(/\s+/g, " ").trim()
+      )
+    );
+
+    if (!confirmedNode) return null;
+
+    const startRect = confirmedNode.getBoundingClientRect();
+    const startY = Math.max(0, startRect.top + window.scrollY - 20);
+
+    const candidates = Array.from(
+      document.querySelectorAll("table, [role='table'], .table, [class*='table']")
+    )
+      .map((node) => {
+        const rect = node.getBoundingClientRect();
+        return {
+          top: rect.top + window.scrollY,
+          bottom: rect.bottom + window.scrollY,
+          width: rect.width,
+          height: rect.height,
+        };
+      })
+      .filter(
+        (rect) =>
+          rect.top >= startY - 50 &&
+          rect.width > 700 &&
+          rect.height > 120
+      );
+
+    const endY = candidates.length
+      ? Math.max(...candidates.map((rect) => rect.bottom))
+      : startY + 900;
+
+    const pageWidth = Math.min(
+      Math.max(document.documentElement.scrollWidth, window.innerWidth),
+      4096
+    );
+
+    return {
+      x: 0,
+      y: startY,
+      width: pageWidth,
+      height: Math.min(Math.max(endY - startY + 25, 350), 2200),
+    };
+  });
+
+  if (clip) {
+    await page.screenshot({
+      path: screenshotPath,
+      clip,
+      animations: "disabled",
+    });
+  } else {
+    await page.screenshot({
+      path: screenshotPath,
+      fullPage: true,
+      animations: "disabled",
+    });
+  }
 }
 
 async function debugDump(page, config, name) {
@@ -375,72 +514,49 @@ export async function collectConfirmedGames({ page, context, config }) {
   }
 
   if (!games.length) {
-    const diagnostics = await page.evaluate(() => ({
-      url: location.href,
-      title: document.title,
-      bodyText: (document.body?.innerText || "")
-        .replace(/\s+/g, " ")
-        .slice(0, 1500),
-      buttons: Array.from(
-        document.querySelectorAll("button, a, [role=button], [role=tab]")
-      )
-        .slice(0, 100)
-        .map((node) =>
-          (node.innerText || node.textContent || node.getAttribute("aria-label") || "")
-            .replace(/\s+/g, " ")
-            .trim()
-        )
-        .filter(Boolean)
-        .slice(0, 40),
-    }));
-
-    console.log("PropFinder diagnostics:", JSON.stringify(diagnostics, null, 2));
-
     throw new Error(
-      `No game selectors were discovered. Current URL: ${diagnostics.url}. ` +
-      `Page title: ${diagnostics.title}. Check the PropFinder diagnostics above in Railway logs.`
+      "No game selectors were discovered. Run once with DEBUG_MODE=true and inspect /data/debug."
     );
   }
 
-  console.log(
-    "Discovered games:",
-    games.map((game) => game.name).join(" | ")
-  );
-
   const results = [];
 
-  for (const game of games) {
+  for (const originalGame of games) {
+    console.log(`Opening ${originalGame.name}...`);
+
+    // PropFinder can re-render the carousel after each click, so refresh targets.
+    const refreshedGames = await discoverGameTargets(page);
+    const game =
+      refreshedGames.find((item) => item.name === originalGame.name) ||
+      originalGame;
+
     const clicked = await clickGame(page, game);
-    if (!clicked) continue;
+
+    if (!clicked) {
+      console.log(`Could not click ${game.name}; skipping.`);
+      continue;
+    }
 
     await page.waitForTimeout(config.pageSettleMs);
 
-    if (!(await isConfirmedLineup(page))) continue;
+    if (!(await isConfirmedLineup(page))) {
+      console.log(`${game.name} does not have a confirmed lineup; skipping.`);
+      continue;
+    }
 
     // Re-apply settings after a game change in case the site resets them.
     await applySavedSettings(page, config);
+    await closeOpenPanels(page);
 
     const pitcher = await getPitcher(page);
-    const target = await getScreenshotTarget(page);
-
     const safeName = game.name.replace(/[^a-z0-9]+/gi, "-").replace(/^-|-$/g, "");
     const screenshotPath = path.join(
       config.dataDir,
       `${new Date().toISOString().slice(0, 10)}-${safeName}.png`
     );
 
-    if (target) {
-      await target.screenshot({
-        path: screenshotPath,
-        animations: "disabled",
-      });
-    } else {
-      await page.screenshot({
-        path: screenshotPath,
-        fullPage: true,
-        animations: "disabled",
-      });
-    }
+    console.log(`Capturing ${game.name}...`);
+    await captureGameSection(page, screenshotPath);
 
     await debugDump(page, config, `game-${safeName}`);
 
