@@ -1,4 +1,4 @@
-FROM mcr.microsoft.com/playwright:v1.55.0-noble
+FROM mcr.microsoft.com/playwright:v1.61.1-noble
 
 WORKDIR /app
 
@@ -10,4 +10,4 @@ COPY . .
 ENV NODE_ENV=production
 ENV PORT=8080
 
-CMD ["npm", "start"]
+CMD ["npm","start"]
