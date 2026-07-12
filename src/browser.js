@@ -134,41 +134,95 @@ async function applySavedSettings(page, config) {
 }
 
 async function discoverGameTargets(page) {
-  const raw = await page.locator("button, [role=tab], a, [data-game-id]").evaluateAll((nodes) =>
-    nodes.map((node, index) => ({
-      index,
-      text: (node.innerText || node.textContent || "").replace(/\s+/g, " ").trim(),
-      tag: node.tagName,
-      href: node.getAttribute("href"),
-      aria: node.getAttribute("aria-label"),
-      gameId: node.getAttribute("data-game-id"),
-    }))
-  );
+  /*
+    PropFinder's matchup cards are not always rendered as buttons or links.
+    Search the live DOM for text containing "Team @ Team", then climb to the
+    nearest clickable/card-like ancestor.
+  */
+  const raw = await page.evaluate(() => {
+    const matchup = /\b[A-Za-z]{2,20}(?:\s+[A-Za-z]{2,20})?\s*@\s*[A-Za-z]{2,20}(?:\s+[A-Za-z]{2,20})?\b/;
+    const results = [];
+    const seen = new Set();
 
-  const seen = new Set();
-  const games = [];
+    const elements = Array.from(document.querySelectorAll("body *"));
 
-  for (const item of raw) {
-    const text = clean(item.text || item.aria);
-    const match = text.match(MATCHUP_RE);
-    if (!match) continue;
+    for (const element of elements) {
+      const text = (element.innerText || element.textContent || "")
+        .replace(/\s+/g, " ")
+        .trim();
 
-    const name = clean(match[0]);
-    if (seen.has(name)) continue;
-    seen.add(name);
+      if (!text || text.length > 250) continue;
 
-    games.push({
-      name,
-      text,
-      href: item.href,
-      gameId: item.gameId,
-    });
-  }
+      const match = text.match(matchup);
+      if (!match) continue;
 
-  return games;
+      const name = match[0].replace(/\s+/g, " ").trim();
+      if (seen.has(name)) continue;
+
+      // Prefer the smallest element that contains the matchup text.
+      const childHasSameMatch = Array.from(element.children || []).some((child) => {
+        const childText = (child.innerText || child.textContent || "")
+          .replace(/\s+/g, " ")
+          .trim();
+        return matchup.test(childText);
+      });
+
+      if (childHasSameMatch) continue;
+
+      let target = element;
+      let cursor = element;
+
+      for (let i = 0; i < 5 && cursor; i += 1, cursor = cursor.parentElement) {
+        const style = window.getComputedStyle(cursor);
+        const clickable =
+          cursor.tagName === "BUTTON" ||
+          cursor.tagName === "A" ||
+          cursor.getAttribute("role") === "button" ||
+          cursor.getAttribute("role") === "tab" ||
+          cursor.hasAttribute("data-game-id") ||
+          cursor.onclick ||
+          style.cursor === "pointer";
+
+        if (clickable) {
+          target = cursor;
+          break;
+        }
+      }
+
+      const id = `pf-game-${results.length}`;
+      target.setAttribute("data-pf-bot-target", id);
+
+      results.push({
+        name,
+        text,
+        targetId: id,
+        tag: target.tagName,
+        href: target.getAttribute("href"),
+        gameId: target.getAttribute("data-game-id"),
+      });
+
+      seen.add(name);
+    }
+
+    return results;
+  });
+
+  return raw;
 }
 
 async function clickGame(page, game) {
+  if (game.targetId) {
+    const tagged = page.locator(
+      `[data-pf-bot-target="${game.targetId.replaceAll('"', '\\"')}"]`
+    ).first();
+
+    if (await tagged.isVisible().catch(() => false)) {
+      await tagged.scrollIntoViewIfNeeded().catch(() => {});
+      await tagged.click({ force: true }).catch(() => {});
+      return true;
+    }
+  }
+
   if (game.href) {
     const link = page.locator(`a[href="${game.href.replaceAll('"', '\\"')}"]`).first();
     if (await link.isVisible().catch(() => false)) {
@@ -187,8 +241,10 @@ async function clickGame(page, game) {
 
   const exactText = page.getByText(game.name, { exact: false });
   const target = await firstVisible(exactText);
+
   if (target) {
-    await target.click();
+    await target.scrollIntoViewIfNeeded().catch(() => {});
+    await target.click({ force: true }).catch(() => {});
     return true;
   }
 
@@ -319,10 +375,37 @@ export async function collectConfirmedGames({ page, context, config }) {
   }
 
   if (!games.length) {
+    const diagnostics = await page.evaluate(() => ({
+      url: location.href,
+      title: document.title,
+      bodyText: (document.body?.innerText || "")
+        .replace(/\s+/g, " ")
+        .slice(0, 1500),
+      buttons: Array.from(
+        document.querySelectorAll("button, a, [role=button], [role=tab]")
+      )
+        .slice(0, 100)
+        .map((node) =>
+          (node.innerText || node.textContent || node.getAttribute("aria-label") || "")
+            .replace(/\s+/g, " ")
+            .trim()
+        )
+        .filter(Boolean)
+        .slice(0, 40),
+    }));
+
+    console.log("PropFinder diagnostics:", JSON.stringify(diagnostics, null, 2));
+
     throw new Error(
-      "No game selectors were discovered. Run once with DEBUG_MODE=true and inspect /data/debug."
+      `No game selectors were discovered. Current URL: ${diagnostics.url}. ` +
+      `Page title: ${diagnostics.title}. Check the PropFinder diagnostics above in Railway logs.`
     );
   }
+
+  console.log(
+    "Discovered games:",
+    games.map((game) => game.name).join(" | ")
+  );
 
   const results = [];
 
