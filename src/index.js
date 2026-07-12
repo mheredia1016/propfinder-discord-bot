@@ -8,9 +8,11 @@ const state = new StateStore(config.dataDir);
 await state.load();
 
 let running = false;
+
 let lastResult = {
   status: "starting",
   lastRunAt: null,
+  foundConfirmedGames: 0,
   posted: 0,
   error: null,
 };
@@ -32,6 +34,7 @@ async function run() {
 
   running = true;
   const startedAt = new Date();
+
   console.log(`[${startedAt.toISOString()}] Starting PropFinder scan...`);
 
   let browser;
@@ -88,12 +91,16 @@ async function run() {
       `[${lastResult.lastRunAt}] Scan complete. Confirmed: ${games.length}. Posted: ${posted}.`
     );
   } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+
     console.error("Run failed:", error);
+
     lastResult = {
       status: "error",
       lastRunAt: new Date().toISOString(),
+      foundConfirmedGames: 0,
       posted: 0,
-      error: error instanceof Error ? error.message : String(error),
+      error: message,
     };
   } finally {
     await browser?.close().catch(() => {});
@@ -103,36 +110,78 @@ async function run() {
 
 const server = http.createServer((req, res) => {
   if (req.url === "/health") {
-    res.writeHead(lastResult.status === "error" ? 503 : 200, {
+    // Always return 200 so Railway knows the service is alive.
+    res.writeHead(200, {
       "content-type": "application/json",
+      "cache-control": "no-store",
     });
-    res.end(JSON.stringify({ running, ...lastResult }));
+
+    res.end(
+      JSON.stringify({
+        service: "propfinder-discord-bot",
+        alive: true,
+        running,
+        ...lastResult,
+      })
+    );
+
     return;
   }
 
   if (req.url === "/run" && req.method === "POST") {
     run().catch(console.error);
-    res.writeHead(202, { "content-type": "application/json" });
-    res.end(JSON.stringify({ accepted: true }));
+
+    res.writeHead(202, {
+      "content-type": "application/json",
+    });
+
+    res.end(
+      JSON.stringify({
+        accepted: true,
+        message: running
+          ? "A scan is already running."
+          : "PropFinder scan accepted.",
+      })
+    );
+
     return;
   }
 
-  res.writeHead(200, { "content-type": "text/plain" });
+  res.writeHead(200, {
+    "content-type": "text/plain",
+  });
+
   res.end("PropFinder Discord Bot is running.\n");
 });
 
-server.listen(Number(process.env.PORT || 8080), "0.0.0.0", () => {
-  console.log(`Health server listening on ${process.env.PORT || 8080}`);
+const port = Number(process.env.PORT || 8080);
+
+server.listen(port, "0.0.0.0", () => {
+  console.log(`Health server listening on ${port}`);
 });
 
 if (config.runOnStart) {
-  await run();
+  // Start the scan after the server is already listening.
+  setTimeout(() => {
+    run().catch(console.error);
+  }, 1000);
 }
 
 if (config.runOnce) {
-  server.close(() => process.exit(lastResult.status === "error" ? 1 : 0));
+  const stopWhenDone = setInterval(() => {
+    if (!running && lastResult.lastRunAt) {
+      clearInterval(stopWhenDone);
+      server.close(() => {
+        process.exit(lastResult.status === "error" ? 1 : 0);
+      });
+    }
+  }, 500);
 } else {
   const intervalMs = Math.max(1, config.checkIntervalMinutes) * 60_000;
-  setInterval(() => run().catch(console.error), intervalMs);
+
+  setInterval(() => {
+    run().catch(console.error);
+  }, intervalMs);
+
   console.log(`Scheduled every ${config.checkIntervalMinutes} minute(s).`);
 }
