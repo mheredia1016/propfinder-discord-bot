@@ -1,0 +1,18 @@
+{
+  "name": "propfinder-discord-bot",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Captures PropFinder MLB HR Matchups screenshots for confirmed lineups and posts them to Discord.",
+  "scripts": {
+    "start": "node src/index.js",
+    "run-once": "RUN_ON_START=true RUN_ONCE=true node src/index.js",
+    "debug": "DEBUG_MODE=true RUN_ON_START=true RUN_ONCE=true node src/index.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "playwright": "^1.55.0"
+  }
+}
